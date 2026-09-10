@@ -505,4 +505,21 @@ class CassandraUtil(config: KarmaPointsV2Config, cassandraUtil: JobsCoreCassandr
     metrics.incCounter(config.dbUpdateCount)
     -currentPoints
   }
+
+  /**
+   * Single-row read of `user_karma_coin_transactions` by its full primary key
+   * `(userid, created_at, transaction_id)` - used by COINS_REAWARD to fetch and validate the
+   * original DEBIT it's reversing. Equality on `userid` in the WHERE clause means a row can only
+   * ever be returned for that exact user, so this doubles as the "belongs to the same userId" check.
+   * Decision-critical (feeds business validation) - LOCAL_QUORUM.
+   */
+  def fetchKarmaCoinTransaction(userId: String, createdAt: Long, transactionId: String): util.List[Row] =
+    guard("fetchKarmaCoinTransaction") {
+      val query: Select = QueryBuilder.select().from(config.sunbird_keyspace, config.user_karma_coin_transactions_table)
+      query.where(QueryBuilder.eq(config.DB_COLUMN_USERID, userId))
+        .and(QueryBuilder.eq(config.CREATED_AT, createdAt))
+        .and(QueryBuilder.eq(config.DB_COLUMN_TRANSACTION_ID, transactionId))
+      query.setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM)
+      cassandraUtil.findAllWithStatement(query)
+    }
 }

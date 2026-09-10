@@ -10,7 +10,7 @@ import org.sunbird.job.karmapoints.v2.domain.UnifiedEvent
 import org.sunbird.job.karmapoints.v2.exceptions.{DataQualityException, MissingEventTypeException, SystemException, UnknownEventTypeException}
 import org.sunbird.job.karmapoints.v2.handlers._
 import org.sunbird.job.karmapoints.v2.storage.{CassandraUtil, RedisUtil}
-import org.sunbird.job.karmapoints.v2.utils.{ExternalServiceClient, FailedEventProducer, KarmaMetrics}
+import org.sunbird.job.karmapoints.v2.utils.{ExternalServiceClient, FailedEventProducer, KarmaMetrics, PaidCourseEnrolmentProducer}
 import org.sunbird.job.util.{HttpUtil, CassandraUtil => JobsCoreCassandraUtil}
 import org.sunbird.job.{BaseProcessKeyedFunction, Metrics}
 
@@ -35,6 +35,7 @@ class KarmaPointsProcessorFnV2(config: KarmaPointsV2Config, httpUtil: HttpUtil)
   @transient private var cassandraUtil: CassandraUtil = _
   @transient private var redisUtil: RedisUtil = _
   @transient private var failedEventProducer: FailedEventProducer = _
+  @transient private var paidCourseEnrolmentProducer: PaidCourseEnrolmentProducer = _
   @transient private var externalServiceClient: ExternalServiceClient = _
   @transient private var karmaMetrics: KarmaMetrics = _
 
@@ -47,6 +48,7 @@ class KarmaPointsProcessorFnV2(config: KarmaPointsV2Config, httpUtil: HttpUtil)
   @transient private var unenrolmentHandler: UnenrolmentHandler = _
   @transient private var pointsConversionHandler: PointsConversionHandler = _
   @transient private var coinsRedemptionHandler: CoinsRedemptionHandler = _
+  @transient private var coinsReawardHandler: CoinsReawardHandler = _
 
   override def open(parameters: Configuration): Unit = {
     super.open(parameters)
@@ -63,6 +65,9 @@ class KarmaPointsProcessorFnV2(config: KarmaPointsV2Config, httpUtil: HttpUtil)
     failedEventProducer = new FailedEventProducer(config)
     failedEventProducer.init()
 
+    paidCourseEnrolmentProducer = new PaidCourseEnrolmentProducer(config)
+    paidCourseEnrolmentProducer.init()
+
     externalServiceClient = new ExternalServiceClient(config, httpUtil)
 
     courseCompletionHandler = new CourseCompletionHandler(config, cassandraUtil, redisUtil, externalServiceClient)
@@ -73,13 +78,15 @@ class KarmaPointsProcessorFnV2(config: KarmaPointsV2Config, httpUtil: HttpUtil)
     eventAttendedHandler = new EventAttendedHandler(config, cassandraUtil, redisUtil, externalServiceClient)
     unenrolmentHandler = new UnenrolmentHandler(config, cassandraUtil, redisUtil)
     pointsConversionHandler = new PointsConversionHandler(config, cassandraUtil, redisUtil)
-    coinsRedemptionHandler = new CoinsRedemptionHandler(config, cassandraUtil, redisUtil)
+    coinsRedemptionHandler = new CoinsRedemptionHandler(config, cassandraUtil, redisUtil, paidCourseEnrolmentProducer)
+    coinsReawardHandler = new CoinsReawardHandler(config, cassandraUtil, redisUtil)
   }
 
   override def close(): Unit = {
     if (cassandraUtil != null) cassandraUtil.close()
     if (redisUtil != null) redisUtil.close()
     if (failedEventProducer != null) failedEventProducer.close()
+    if (paidCourseEnrolmentProducer != null) paidCourseEnrolmentProducer.close()
     super.close()
   }
 
@@ -152,7 +159,8 @@ class KarmaPointsProcessorFnV2(config: KarmaPointsV2Config, httpUtil: HttpUtil)
     case config.EVENT_TYPE_FIRST_LOGIN => event.dataEdataString("id")
     case config.EVENT_TYPE_UNENROLMENT => event.dataEdataString("userIds")
     case config.EVENT_TYPE_COURSE_COMPLETION => event.edataStringArrayFirst("userIds")
-    case config.EVENT_TYPE_POINTS_CONVERSION | config.EVENT_TYPE_COINS_REDEMPTION => event.dataString("userId")
+    case config.EVENT_TYPE_POINTS_CONVERSION | config.EVENT_TYPE_COINS_REDEMPTION | config.EVENT_TYPE_COINS_REAWARD =>
+      event.dataString("userId")
     case _ =>
       val topLevel = event.userId
       if (StringUtils.isNotEmpty(topLevel)) topLevel else event.edataString("userId")
@@ -180,6 +188,7 @@ class KarmaPointsProcessorFnV2(config: KarmaPointsV2Config, httpUtil: HttpUtil)
       case config.EVENT_TYPE_UNENROLMENT => unenrolmentHandler.handle(event)
       case config.EVENT_TYPE_POINTS_CONVERSION => pointsConversionHandler.handle(event)
       case config.EVENT_TYPE_COINS_REDEMPTION => coinsRedemptionHandler.handle(event)
+      case config.EVENT_TYPE_COINS_REAWARD => coinsReawardHandler.handle(event)
       case other => throw UnknownEventTypeException(s"Unknown eventType: '$other' for userId=${event.userId}")
     }
   }
@@ -194,11 +203,13 @@ class KarmaPointsProcessorFnV2(config: KarmaPointsV2Config, httpUtil: HttpUtil)
    * inject mocks and exercise validateEvent/routeEvent/error-handling without live infra.
    */
   private[v2] def initForTest(cassandraUtil: CassandraUtil, redisUtil: RedisUtil,
-                              failedEventProducer: FailedEventProducer, externalServiceClient: ExternalServiceClient): Unit = {
+                              failedEventProducer: FailedEventProducer, externalServiceClient: ExternalServiceClient,
+                              paidCourseEnrolmentProducer: PaidCourseEnrolmentProducer): Unit = {
     this.cassandraUtil = cassandraUtil
     this.redisUtil = redisUtil
     this.failedEventProducer = failedEventProducer
     this.externalServiceClient = externalServiceClient
+    this.paidCourseEnrolmentProducer = paidCourseEnrolmentProducer
     this.courseCompletionHandler = new CourseCompletionHandler(config, cassandraUtil, redisUtil, externalServiceClient)
     this.ratingHandler = new RatingEventHandler(config, cassandraUtil, redisUtil)
     this.firstEnrolmentHandler = new FirstEnrolmentHandler(config, cassandraUtil, redisUtil)
@@ -207,7 +218,8 @@ class KarmaPointsProcessorFnV2(config: KarmaPointsV2Config, httpUtil: HttpUtil)
     this.eventAttendedHandler = new EventAttendedHandler(config, cassandraUtil, redisUtil, externalServiceClient)
     this.unenrolmentHandler = new UnenrolmentHandler(config, cassandraUtil, redisUtil)
     this.pointsConversionHandler = new PointsConversionHandler(config, cassandraUtil, redisUtil)
-    this.coinsRedemptionHandler = new CoinsRedemptionHandler(config, cassandraUtil, redisUtil)
+    this.coinsRedemptionHandler = new CoinsRedemptionHandler(config, cassandraUtil, redisUtil, paidCourseEnrolmentProducer)
+    this.coinsReawardHandler = new CoinsReawardHandler(config, cassandraUtil, redisUtil)
   }
 
   /**

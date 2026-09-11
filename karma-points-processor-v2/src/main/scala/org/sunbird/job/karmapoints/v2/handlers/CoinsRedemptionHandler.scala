@@ -7,6 +7,7 @@ import org.sunbird.job.karmapoints.v2.config.KarmaPointsV2Config
 import org.sunbird.job.karmapoints.v2.domain.UnifiedEvent
 import org.sunbird.job.karmapoints.v2.exceptions.{CassandraException, InvalidPayloadException, InvalidUserIdException, MissingPayloadException}
 import org.sunbird.job.karmapoints.v2.storage.{CassandraUtil, RedisUtil}
+import org.sunbird.job.karmapoints.v2.utils.PaidCourseEnrolmentProducer
 import org.sunbird.job.util.JSONUtil
 
 import java.time.LocalDate
@@ -15,7 +16,7 @@ import java.util.UUID
 
 /** Fields extracted once validation passes, so `doHandle` never re-parses `event.data`. */
 private[v2] case class CoinsRedemptionRequest(userId: String, operation: String, actionType: String,
-                                              pointsToConvert: Long, contextType: String, contextId: String)
+                                              coinsToRedeem: Long, contextType: String, contextId: String)
 
 /** Business calculation result, reused to build the frozen plan below. No monthly-cap fields
  * (unlike [[PointsConversionHandler.PointsConversionCalculation]]) - DEBIT has no monthly cap and
@@ -41,7 +42,7 @@ private[v2] case class RedemptionResumeWithPlan(plan: RedemptionPlan) extends Re
 /**
  * Handles COINS_REDEMPTION (DEBIT) events - a user spending Karma Coins (e.g. external course
  * enrollment). Payload: `data.userId`, `data.operation` ("DEBIT"), `data.actionType`
- * ("POINTS_REDEMPTION"), `data.pointsToConvert`, `data.contextType`, `data.contextId`. Unlike
+ * ("POINTS_REDEMPTION"), `data.coinsToRedeem`, `data.contextType`, `data.contextId`. Unlike
  * POINTS_CONVERSION's `contextType`, this one is an external-context discriminator (e.g.
  * "EXT_COURSE_ENROLLMENT"), not a fixed literal - only presence is validated. `courseName`/
  * `providerName` are carried through to the transaction addinfo but are not mandatory.
@@ -49,7 +50,7 @@ private[v2] case class RedemptionResumeWithPlan(plan: RedemptionPlan) extends Re
  * Flow: validate -> Redis first-level dedup (when `coinsRedemptionDedupEnabled`) -> Cassandra
  * `claimOrResume` (LWT claim on `user_karma_coin_lookup`, `operation_type=COINS_REDEMPTION` so a
  * CREDIT and a DEBIT for the same `contextId` never collide) -> `calculateRedemption` (validates
- * `pointsToConvert <= total_earned - total_redeemed`; no partial redemption) -> `writePlan`
+ * `coinsToRedeem <= total_earned - total_redeemed`; no partial redemption) -> `writePlan`
  * (freezes the target wallet values + a transaction id into the still-PROCESSING lookup row) ->
  * `applyPlan` (wallet -> DEBIT transaction -> lookup SUCCESS -> Redis wallet-cache refresh).
  *
@@ -58,7 +59,8 @@ private[v2] case class RedemptionResumeWithPlan(plan: RedemptionPlan) extends Re
  * before writing it) is `RedemptionProceed`, i.e. redo `calculateRedemption` from live state.
  * Mirrors [[PointsConversionHandler]]'s claimOrResume/writePlan/applyPlan design throughout.
  */
-class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: CassandraUtil, redisUtil: RedisUtil) extends EventHandler {
+class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: CassandraUtil, redisUtil: RedisUtil,
+                             paidCourseEnrolmentProducer: PaidCourseEnrolmentProducer) extends EventHandler {
 
   private val logger = LoggerFactory.getLogger(classOf[CoinsRedemptionHandler])
 
@@ -98,7 +100,7 @@ class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassand
           applyRedemptionPlan(request, event, plan)
           lastHandledEvent = Some(event)
           logger.info(s"COINS_REDEMPTION completed successfully: userId=${request.userId}, contextId=${request.contextId}, " +
-            s"pointsToConvert=${request.pointsToConvert}")
+            s"coinsToRedeem=${request.coinsToRedeem}")
 
         case RedemptionResumeWithPlan(plan) =>
           // Plan was already frozen by a prior crashed attempt - re-apply it as-is, never
@@ -122,7 +124,7 @@ class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassand
   }
 
   /** Full envelope validation for COINS_REDEMPTION, in order: userId -> operation -> actionType ->
-   * pointsToConvert -> contextType -> contextId. Throws on the first failing check. */
+   * coinsToRedeem -> contextType -> contextId. Throws on the first failing check. */
   private[v2] def validateEvent(event: UnifiedEvent): CoinsRedemptionRequest = {
     val userId = event.dataString("userId")
     if (StringUtils.isEmpty(userId)) {
@@ -144,11 +146,11 @@ class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassand
           s"got '$actionType', userId=$userId"
       )
     }
-    val pointsToConvert = event.dataLong("pointsToConvert", 0L)
-    if (pointsToConvert <= 0) {
+    val coinsToRedeem = event.dataLong("coinsToRedeem", 0L)
+    if (coinsToRedeem <= 0) {
       throw InvalidPayloadException(
-        s"data.pointsToConvert must be > 0 for COINS_REDEMPTION event, " +
-          s"got '$pointsToConvert', userId=$userId"
+        s"data.coinsToRedeem must be > 0 for COINS_REDEMPTION event, " +
+          s"got '$coinsToRedeem', userId=$userId"
       )
     }
     val contextType = event.dataString("contextType")
@@ -163,7 +165,7 @@ class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassand
         s"data.contextId is required for COINS_REDEMPTION event, userId=$userId"
       )
     }
-    CoinsRedemptionRequest(userId, operation, actionType, pointsToConvert, contextType, contextId)
+    CoinsRedemptionRequest(userId, operation, actionType, coinsToRedeem, contextType, contextId)
   }
 
   /** `userId|contextType|contextId` - the Redis dedup key and the Cassandra lookup's
@@ -252,7 +254,7 @@ class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassand
    * compute available balance -> validate the requested amount doesn't exceed it -> compute the
    * DEBIT target values.
    *
-   * @throws InvalidPayloadException if `pointsToConvert` exceeds the available balance
+   * @throws InvalidPayloadException if `coinsToRedeem` exceeds the available balance
    *                                 (`total_earned - total_redeemed`) - a business rejection, not
    *                                 an infra failure. No partial redemption - any excess rejects
    *                                 the whole request. The caller marks the lookup FAILED before
@@ -261,12 +263,12 @@ class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassand
   private[v2] def calculateRedemption(request: CoinsRedemptionRequest): CoinsRedemptionCalculation = {
     val (totalEarned, totalRedeemed) = readWallet(request.userId)
     val availableCoins = totalEarned - totalRedeemed
-    if (request.pointsToConvert > availableCoins) {
+    if (request.coinsToRedeem > availableCoins) {
       throw InvalidPayloadException(
-        s"data.pointsToConvert (${request.pointsToConvert}) exceeds available Karma Coin balance " +
+        s"data.coinsToRedeem (${request.coinsToRedeem}) exceeds available Karma Coin balance " +
           s"($availableCoins) for userId=${request.userId}, contextId=${request.contextId}")
     }
-    val targetTotalRedeemed = totalRedeemed + request.pointsToConvert.toInt
+    val targetTotalRedeemed = totalRedeemed + request.coinsToRedeem.toInt
     CoinsRedemptionCalculation(totalEarned, totalRedeemed, targetTotalRedeemed, totalEarned - targetTotalRedeemed)
   }
 
@@ -305,10 +307,11 @@ class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassand
     plan
   }
 
-  /** Applies a frozen plan: wallet -> DEBIT transaction -> lookup SUCCESS -> Redis refresh, in that
-   * order (Cassandra first, Redis best-effort last). Every write is an absolute-value upsert or a
-   * deterministic-key insert driven by the plan, so this is safe to re-run in full. No
-   * `user_karma_coin_monthly_summary` write - DEBIT has no monthly cap. */
+  /** Applies a frozen plan: wallet -> DEBIT transaction -> lookup SUCCESS -> Redis refresh ->
+   * EXT_COURSE_ENROLLMENT publish, in that order (Cassandra first, Redis and Kafka best-effort
+   * last). Every write is an absolute-value upsert or a deterministic-key insert driven by the
+   * plan, so this is safe to re-run in full. No `user_karma_coin_monthly_summary` write - DEBIT
+   * has no monthly cap. */
   private[v2] def applyRedemptionPlan(request: CoinsRedemptionRequest, event: UnifiedEvent, plan: RedemptionPlan)
                                      (implicit metrics: Metrics): Unit = {
     logger.info(
@@ -325,17 +328,17 @@ class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassand
       config.ADDINFO_COURSE_NAME -> event.dataString("courseName"),
       config.ADDINFO_PROVIDER_NAME -> event.dataString("providerName"))
     cassandraUtil.insertKarmaCoinTransaction(request.userId, plan.createdAt, plan.transactionId, config.OPERATION_DEBIT,
-      request.pointsToConvert, balanceAfter, config.ACTION_TYPE_POINTS_REDEMPTION,
+      request.coinsToRedeem, balanceAfter, config.ACTION_TYPE_POINTS_REDEMPTION,
       request.contextType, request.contextId, transactionAddInfo)
     logger.info(
       s"COINS_REDEMPTION transaction persisted, " +
         s"userId=${request.userId}, transactionId=${plan.transactionId}, " +
-        s"amount=${request.pointsToConvert}, balanceAfter=$balanceAfter"
+        s"amount=${request.coinsToRedeem}, balanceAfter=$balanceAfter"
     )
 
     // updateLookupStatus always starts from an empty addinfo map, so listing only
     updateLookupStatus(request, plan.createdAt, config.STATUS_SUCCESS,
-      config.ADDINFO_TRANSACTION_ID -> plan.transactionId, config.ADDINFO_POINTS_USED -> request.pointsToConvert)
+      config.ADDINFO_TRANSACTION_ID -> plan.transactionId, config.ADDINFO_POINTS_USED -> request.coinsToRedeem)
     logger.info(
       s"COINS_REDEMPTION lookup marked SUCCESS, " +
         s"userId=${request.userId}, contextId=${request.contextId}, " +
@@ -346,6 +349,13 @@ class CoinsRedemptionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassand
     // here (rather than hardcoding 0) avoids clobbering a legitimately-cached CREDIT value.
     val (yearMonth, convertedThisMonth) = currentPointsConvertedThisMonth(request.userId)
     redisUtil.setKarmaCoinWallet(request.userId, plan.targetTotalEarned, plan.targetTotalRedeemed, yearMonth, convertedThisMonth)
+
+    // Redemption is fully committed at this point - publish the paid-course-enrolment event so
+    // the external course can enroll the user. transactionId/createdAt come from the same frozen
+    // plan as the DEBIT transaction, so a resumed/replayed apply republishes under the same
+    // transactionId rather than a new one.
+    paidCourseEnrolmentProducer.send(request.userId, request.contextType, request.contextId,
+      request.coinsToRedeem, plan.transactionId, plan.createdAt)
   }
 
   /** Current calendar month's `points_converted`, reused as-is from

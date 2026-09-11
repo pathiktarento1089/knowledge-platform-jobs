@@ -13,6 +13,7 @@ class KarmaPointsV2Config(override val config: Config) extends BaseJobConfig(con
   // Kafka
   val kafkaInputTopic: String = config.getString("kafka.input.topic")
   val kafkaFailedTopic: String = config.getString("kafka.failed.topic")
+  val kafkaPaidCourseEnrolmentTopic: String = config.getString("kafka.output.paid.course.enrolment.topic")
   val karmaPointsV2Consumer: String = "karma-points-unified-v2-consumer"
   override val kafkaConsumerParallelism: Int = config.getInt("task.consumer.parallelism")
 
@@ -81,10 +82,16 @@ class KarmaPointsV2Config(override val config: Config) extends BaseJobConfig(con
 
   val EVENT_TYPE_POINTS_CONVERSION = "POINTS_CONVERSION"
   val EVENT_TYPE_COINS_REDEMPTION = "COINS_REDEMPTION"
+  val EVENT_TYPE_EXT_COURSE_ENROLLMENT = "EXT_COURSE_ENROLLMENT"
+  // Also COINS_REAWARD's required actionType literal and its Cassandra operation_type value -
+  // same one-constant-for-all-three-roles reuse as EVENT_TYPE_POINTS_CONVERSION above.
+  val EVENT_TYPE_COINS_REAWARD = "COINS_REAWARD"
 
   val OPERATION_CREDIT = "CREDIT"
   val OPERATION_DEBIT = "DEBIT"
+  val OPERATION_ENROLLMENT = "ENROLLMENT"
   val ACTION_TYPE_POINTS_REDEMPTION = "POINTS_REDEMPTION"
+  val ACTION_TYPE_ENROLLMENT = "ENROLLMENT"
 
   val pointsConversionMonthlyLimit: Int =
     if (config.hasPath("karmaCoin.pointsConversion.monthlyLimit")) config.getInt("karmaCoin.pointsConversion.monthlyLimit") else 300
@@ -102,6 +109,11 @@ class KarmaPointsV2Config(override val config: Config) extends BaseJobConfig(con
   val coinsRedemptionDedupEnabled: Boolean =
     if (config.hasPath("karmaCoin.redis.coinsRedemptionDedupEnabled"))
       config.getBoolean("karmaCoin.redis.coinsRedemptionDedupEnabled")
+    else
+      true
+  val coinsReawardDedupEnabled: Boolean =
+    if (config.hasPath("karmaCoin.redis.coinsReawardDedupEnabled"))
+      config.getBoolean("karmaCoin.redis.coinsReawardDedupEnabled")
     else
       true
 
@@ -212,7 +224,15 @@ class KarmaPointsV2Config(override val config: Config) extends BaseJobConfig(con
   val ADDINFO_TARGET_POINTS_CONVERTED = "targetPointsConverted"
   val ERROR_CODE_CONVERSION_LIMIT_EXCEEDED = "CONVERSION_LIMIT_EXCEEDED"
   val ERROR_CODE_INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+  val ERROR_CODE_INVALID_REAWARD = "INVALID_REAWARD_REQUEST"
   val TRANSACTION_ID_PREFIX = "KARMA_COIN"
+
+  // COINS_REAWARD - links the reaward (CREDIT) transaction back to the original redemption (DEBIT)
+  // it reverses; carried in the new transaction's addinfo, never written onto the original row.
+  val ADDINFO_ORIGINAL_TRANSACTION_ID = "originalTransactionId"
+  val ADDINFO_ORIGINAL_CREATED_AT = "originalCreatedAt"
+  val ADDINFO_INFO = "info"
+  val ADDINFO_COINS_REAWARDED = "coinsReawarded"
 
   // Metric names
   val totalEventsCount = "total-events-count"

@@ -395,11 +395,14 @@ class PointsConversionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassan
 
   /**
    * Applies a frozen plan: wallet -> monthly summary -> transaction -> lookup SUCCESS -> Redis
-   * refresh, in that order (Cassandra, source of truth, first; Redis best-effort, last). Every
-   * Cassandra write here is an absolute-value upsert (or, for the transaction, an insert with a
+   * refresh -> Redis lock cleanup, in that order (Cassandra, source of truth, first; Redis best-effort, last).
+   * Every Cassandra write here is an absolute-value upsert (or, for the transaction, an insert with a
    * fully deterministic primary key) driven by the plan - safe to re-run in full regardless of how
    * much of it a previous attempt already completed, so no probing/branching on which step was
    * already done is needed.
+   *
+   * For POINTS_CONVERSION only: deletes the Redis conversion lock key (CB_EXT_karmaCoinConvertLock:<userId>)
+   * after the lookup status is successfully persisted as COMPLETED, ensuring idempotent cleanup.
    */
   private[v2] def applyConversionPlan(request: PointsConversionRequest, plan: ConversionPlan)(implicit metrics: Metrics): Unit = {
     logger.info(
@@ -413,7 +416,9 @@ class PointsConversionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassan
 
     val balanceAfter = plan.targetTotalEarned - plan.targetTotalRedeemed
     val transactionAddInfo = cassandraUtil.buildAddInfo(null,
-      config.ADDINFO_POINTS_USED -> request.pointsToConvert,
+      config.STATUS -> config.STATUS_SUCCESS,
+      config.ADDINFO_USER_KARMA_COIN_KEY -> userKarmaCoinKey(request),
+      config.ADDINFO_POINTS_CONVERTED -> request.pointsToConvert,
       config.ADDINFO_RATIO -> config.RATIO_ONE_TO_ONE)
     cassandraUtil.insertKarmaCoinTransaction(request.userId, plan.createdAt, plan.transactionId, config.OPERATION_CREDIT,
       calculateCoins(request.pointsToConvert), balanceAfter, config.EVENT_TYPE_POINTS_CONVERSION,
@@ -424,6 +429,9 @@ class PointsConversionHandler(config: KarmaPointsV2Config, cassandraUtil: Cassan
 
     redisUtil.setKarmaCoinWallet(request.userId, plan.targetTotalEarned, plan.targetTotalRedeemed,
       plan.targetYearMonth, plan.targetPointsConverted)
+
+    // Delete the Redis conversion lock key after successful POINTS_CONVERSION completion
+    redisUtil.deleteKarmaCoinConvertLock(request.userId)
     logger.info(
       s"POINTS_CONVERSION completed, userId=${request.userId}, " +
         s"transactionId=${plan.transactionId}, points=${request.pointsToConvert}"

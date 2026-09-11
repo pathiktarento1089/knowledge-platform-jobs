@@ -7,11 +7,11 @@ import org.sunbird.job.karmapoints.v2.config.KarmaPointsV2Config
 import org.sunbird.job.karmapoints.v2.domain.UnifiedEvent
 import org.sunbird.job.karmapoints.v2.exceptions.{CassandraException, InvalidPayloadException, InvalidUserIdException, MissingPayloadException}
 import org.sunbird.job.karmapoints.v2.storage.{CassandraUtil, RedisUtil}
+import org.sunbird.job.karmapoints.v2.utils.TransactionIdGenerator
 import org.sunbird.job.util.JSONUtil
 
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
-import java.util.UUID
 
 /** Fields extracted once validation passes, so `doHandle` never re-parses `event.data`.
  * `originalTransactionId`/`originalCreatedAt` identify the DEBIT this reaward reverses - distinct
@@ -371,7 +371,7 @@ class CoinsReawardHandler(config: KarmaPointsV2Config, cassandraUtil: CassandraU
   private[v2] def createAndPersistReawardPlan(request: CoinsReawardRequest, calculation: CoinsReawardCalculation,
                                               creditDate: Long)(implicit metrics: Metrics): ReawardPlan = {
     val plan = ReawardPlan(
-      transactionId = generateTransactionId(creditDate),
+      transactionId = TransactionIdGenerator.generate(config),
       createdAt = creditDate,
       targetTotalEarned = calculation.totalEarned,
       targetTotalRedeemed = calculation.targetTotalRedeemed,
@@ -443,10 +443,4 @@ class CoinsReawardHandler(config: KarmaPointsV2Config, cassandraUtil: CassandraU
     val converted = if (rows != null && rows.size() > 0) rows.get(0).getInt(config.POINTS_CONVERTED) else 0
     (yearMonth, converted)
   }
-
-  /** `PREFIX.timestamp.UUID`, the repo-wide id convention (same format as
-   * [[CoinsRedemptionHandler.generateTransactionId]]). Generated once in [[createAndPersistReawardPlan]]
-   * and persisted - a replay reuses the same id from the recovered plan. */
-  private[v2] def generateTransactionId(createdAt: Long): String =
-    s"${config.TRANSACTION_ID_PREFIX}.$createdAt.${UUID.randomUUID().toString}"
 }

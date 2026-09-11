@@ -120,5 +120,25 @@ class RedisUtil(dataCache: DataCache, config: KarmaPointsV2Config) {
     }
   }
 
+  private def karmaCoinConvertLockKeyFor(userId: String): String = s"${config.KARMA_COIN_CONVERT_LOCK_PREFIX}:$userId"
+
+  /**
+   * Deletes the external Karma Coin conversion lock key (set by the upstream caller before
+   * publishing a POINTS_CONVERSION event) once that conversion has fully completed - so a
+   * subsequent conversion request for the same user is no longer blocked by it. Best-effort,
+   * same fail-safe shape as every other method in this class. Reuses jobs-core's existing
+   * `DataCache.delWithRetry` - no new Redis primitive.
+   */
+  def deleteKarmaCoinConvertLock(userId: String): Unit = {
+    try {
+      dataCache.delWithRetry(karmaCoinConvertLockKeyFor(userId))
+    } catch {
+      case ex@(_: JedisConnectionException | _: JedisException) =>
+        logger.error(s"Failed to delete karma coin convert lock in Redis for userId=$userId (best-effort, not fatal)", ex)
+      case ex: Exception =>
+        logger.error(s"Unexpected error deleting karma coin convert lock in Redis for userId=$userId (best-effort, not fatal)", ex)
+    }
+  }
+
   def close(): Unit = dataCache.close()
 }

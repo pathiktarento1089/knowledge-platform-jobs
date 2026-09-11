@@ -101,6 +101,8 @@ class KarmaPointsV2Config(override val config: Config) extends BaseJobConfig(con
   val karmaCoinRequestClaimTTLSeconds: Int =
     if (config.hasPath("karmaCoin.redis.requestClaimTtlSeconds")) config.getInt("karmaCoin.redis.requestClaimTtlSeconds") else 14400
 
+  val KARMA_COIN_CONVERT_LOCK_PREFIX = "CB_EXT_karmaCoinConvertLock"
+
   val pointsConversionDedupEnabled: Boolean =
     if (config.hasPath("karmaCoin.redis.pointsConversionDedupEnabled"))
       config.getBoolean("karmaCoin.redis.pointsConversionDedupEnabled")
@@ -209,6 +211,7 @@ class KarmaPointsV2Config(override val config: Config) extends BaseJobConfig(con
   val ADDINFO_ERROR_CODE = "errorCode"
   val ADDINFO_ERROR_MESSAGE = "errorMessage"
   val ADDINFO_TRANSACTION_ID = "transactionId"
+  val ADDINFO_USER_KARMA_COIN_KEY = "userKarmaCoinKey"
   val ADDINFO_POINTS_CONVERTED = "pointsConverted"
   val ADDINFO_POINTS_USED = "pointsUsed"
   val ADDINFO_RATIO = "ratio"
@@ -225,7 +228,11 @@ class KarmaPointsV2Config(override val config: Config) extends BaseJobConfig(con
   val ERROR_CODE_CONVERSION_LIMIT_EXCEEDED = "CONVERSION_LIMIT_EXCEEDED"
   val ERROR_CODE_INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
   val ERROR_CODE_INVALID_REAWARD = "INVALID_REAWARD_REQUEST"
-  val TRANSACTION_ID_PREFIX = "KARMA_COIN"
+  val TRANSACTION_ID_PREFIX = "TXN"
+  // Number of hex characters (from a UUID, dashes stripped) used as the uniqueness suffix in
+  // "TXN-<timestamp>-<suffix>" - config-driven so it can be widened/narrowed without a code change.
+  val TRANSACTION_ID_SUFFIX_LENGTH: Int =
+    if (config.hasPath("karmaCoin.transactionId.suffixLength")) config.getInt("karmaCoin.transactionId.suffixLength") else 16
 
   // COINS_REAWARD - links the reaward (CREDIT) transaction back to the original redemption (DEBIT)
   // it reverses; carried in the new transaction's addinfo, never written onto the original row.
